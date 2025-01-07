@@ -280,12 +280,14 @@ class L2Wrap(torch.autograd.Function):
 
 
 class RWKV(pl.LightningModule):
-    def __init__(self, args):
+    def __init__(self, args, n_classes=1000):
         super().__init__()
         self.args = args
         self.emb = nn.Embedding(args.vocab_size, args.n_embd)
-        self.blocks = nn.ModuleList([Block(args, i) for i in range(args.n_layer)])
+        self.blocks_alpha = nn.ModuleList([Block(args, i) for i in range(args.n_layer // 4)])
+        self.blocks_beta = nn.ModuleList([Block(args, i) for i in range(args.n_layer // 4, args.n_layer)])
         self.ln_out = nn.LayerNorm(args.n_embd)
+        self.classifier = nn.Linear(args.n_embd, n_classes)
         self.head = nn.Linear(args.n_embd, args.vocab_size, bias=False)
 
         if args.dropout > 0:
@@ -324,7 +326,16 @@ class RWKV(pl.LightningModule):
             x = self.drop0(x)
 
         v_first = torch.empty_like(x)
-        for block in self.blocks:
+        for block in self.blocks_alpha:
+            if args.grad_cp == 1:
+                x, v_first = deepspeed.checkpointing.checkpoint(block, x, mask, v_first)
+            else:
+                x, v_first = block(x, mask, v_first)
+
+        x_mean = x.mean(dim=1)
+        logits = self.classifier(x_mean)
+
+        for block in self.blocks_beta:
             if args.grad_cp == 1:
                 x, v_first = deepspeed.checkpointing.checkpoint(block, x, mask, v_first)
             else:
@@ -332,7 +343,7 @@ class RWKV(pl.LightningModule):
 
         x = self.ln_out(x)
         x = self.head(x)
-        return self.unpad(x, num_tokens_to_pad)
+        return self.unpad(x, num_tokens_to_pad), logits
 
 
 class VisualRWKV(pl.LightningModule):
@@ -387,11 +398,11 @@ class VisualRWKV(pl.LightningModule):
     def forward(self, samples):
         x, targets, masks = self.preparing_embedding(samples)
         # unidirectional forward
-        logits = self.rwkv(x, masks)
-        return logits, targets
+        logits, class_logits = self.rwkv(x, masks)
+        return logits, targets, class_logits
     
-    def training_step(self, batch, batch_idx):
-        logits, targets = self(batch)
+    def training_step(self, batch, batch_class, batch_idx):
+        logits, targets, class_logits = self(batch)
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = targets[..., 1:].contiguous()
         # calculate valid length for each sample
@@ -406,6 +417,7 @@ class VisualRWKV(pl.LightningModule):
         # Average the loss by valid label length
         loss = loss.view(shift_labels.size()).sum(1) / valid_lengths # [B*T] -> [B, T] -> [B]
         loss = loss.mean() # average over batch
+        loss = (loss + F.cross_entropy(class_logits, batch_class).mean()) / 2
         return L2Wrap.apply(loss, logits)
     
     def training_step_end(self, batch_parts):
